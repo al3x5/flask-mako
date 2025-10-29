@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# -*- encoding: utf-8 -*-
 """
     flask.ext.mako
     ~~~~~~~~~~~~~~~~~~~~~~~
@@ -7,104 +7,106 @@
     flask-babel
 
     :copyright: (c) 2012 by Béranger Enselme <benselme@gmail.com>
+    :copyright: (c) 2024 by Nicolas Desprès <nicolas.despres@gmail.com>
     :license: BSD, see LICENSE for more details.
 """
+
+
 import os, sys
 
-from werkzeug.utils import cached_property
+from markupsafe import escape
+
 from flask.signals import template_rendered
-
-# Find the context stack so we can resolve which application is calling this
-# extension.  Starting with Flask 0.9, the _app_ctx_stack is the correct one,
-# before that we need to use the _request_ctx_stack.
-try:
-    from flask import _app_ctx_stack as stack
-except ImportError:
-    from flask import _request_ctx_stack as stack
-
-from werkzeug.debug.tbtools import DebugTraceback as Traceback, DebugFrameSummary as Frame
+from flask import current_app
+from flask import g as GLOBAL
 
 from mako.lookup import TemplateLookup
 from mako.template import Template
 from mako import exceptions
-from mako.exceptions import RichTraceback, text_error_template
+from mako.exceptions import RichTraceback
 
 
 itervalues = getattr(dict, 'itervalues', dict.values)
 
-_BABEL_IMPORTS =  'from flask_babel import gettext as _, ngettext, ' \
+_BABEL_IMPORTS =  'from flask.ext.babel import gettext as _, ngettext, ' \
                   'pgettext, npgettext'
 _FLASK_IMPORTS =  'from flask.helpers import url_for, get_flashed_messages'
 
-class MakoFrame(Frame):
-    """ A special `~werkzeug.debug.tbtools.Frame` object for Mako sources. """
-    def __init__(self, exc_type, exc_value, tb, name, line):
-        super(MakoFrame, self).__init__(exc_type, exc_value, tb)
-        self.info = "(translated Mako exception)"
-        self.filename = name
-        self.lineno = line
-        old_locals = self.locals
-        self.locals = dict(tb.tb_frame.f_locals['context'].kwargs)
-        self.locals['__mako_module_locals__'] = old_locals
 
-    def get_annotated_lines(self):
-        """
-        Remove frame-finding code from `~werkzeug.debug.tbtools.Frame`. This
-        code is actively dangerous when run on Mako templates because
-        Werkzeug's parsing doesn't understand their syntax. Instead, just mark
-        the current line.
-
-        """
-        lines = [Line(idx + 1, x) for idx, x in enumerate(self.sourcelines)]
-
-        try:
-            lines[self.lineno - 1].current = True
-        except IndexError:
-            pass
-
-        return lines
-
-
-class TemplateError(RichTraceback, RuntimeError):
-    """ A template has thrown an error during rendering. """
-
-    def werkzeug_debug_traceback(self, exc_type, exc_value, tb):
-        """ Munge the default Werkzeug traceback to include Mako info. """
-
-        orig_type, orig_value, orig_tb = self.einfo
-        translated = Traceback(orig_type, orig_value, tb)
-
-        # Drop the "raise" frame from the traceback.
-        translated.frames.pop()
-
-        def orig_frames():
-            cur = orig_tb
-            while cur:
-                yield cur
-                cur = cur.tb_next
-
-        # Append our original frames, overwriting previous source information
-        # with the translated Mako line locators.
-        for tb, record in zip(orig_frames(), self.records):
-            name, line = record[4:6]
-            if name:
-                new_frame = MakoFrame(orig_type, orig_value, tb, name, line)
-            else:
-                new_frame = Frame(orig_type, orig_value, tb)
-
-            translated.frames.append(new_frame)
-
-        return translated
-
+class MakoTemplateError(RuntimeError):
+    """A template has thrown an error during rendering."""
 
     def __init__(self, template):
-        super(TemplateError, self).__init__()
-        self.einfo = sys.exc_info()
-        self.text = text_error_template().render()
-        msg = "Error occurred while rendering template '{0}'"
-        msg = msg.format(template.uri)
-        super(TemplateError, self).__init__(msg)
+        msg = "Error occurred while rendering template '{0}'".format(template.uri)
+        super(MakoTemplateError, self).__init__(msg)
+        self.template = template
+        self.rich_traceback = RichTraceback()
 
+_SKELETON_HTML = """\
+<!doctype html>
+<html lang=en>
+  <head>
+    <title>%(title)s</title>
+    <link rel="stylesheet" href="?__debugger__=yes&amp;cmd=resource&amp;f=style.css">
+    <link rel="shortcut icon"
+        href="?__debugger__=yes&amp;cmd=resource&amp;f=console.png">
+  </head>
+  <body style="background-color: #fff">
+    <div class="debugger">
+      <h1>%(exception_type)s</h1>
+      <div class="detail">
+        <p class="errormsg">%(exception)s</p>
+      </div>
+      <p>While rendering Mako's template: %(template_uri)s</p>
+      <h2 class="traceback">Traceback <em>(most recent call last)</em></h2>
+      <div class="traceback">
+        <ul>%(frames)s</ul>
+      </div>
+    </div>
+  </body>
+</html>
+"""
+
+_FRAME_HTML = """\
+<li>
+  <div class="frame">
+    <h4>File <cite class="filename">"%(filename)s"</cite>,
+        line <em class="line">%(lineno)s</em>,
+        in <code class="function">%(function_name)s</code></h4>
+    <div class="source %(classes)s">
+      <pre class="line current">
+        %(line)s
+      </pre>
+    </div>
+  </div>
+</li>
+"""
+
+def is_template_filename(filename, template):
+    return any(filename.startswith(d) for d in template.lookup.directories)
+
+
+def render_mako_error(e: MakoTemplateError) -> str:
+    frames = []
+    for filename, lineno, function_name, line in e.rich_traceback.traceback:
+        classes = []
+        if not is_template_filename(filename, e.template):
+            classes.append("library")
+        frames.append(_FRAME_HTML % dict(
+            filename=escape(filename),
+            lineno=escape(lineno),
+            function_name=escape(function_name),
+            line=escape(line),
+            classes=" ".join(classes)
+        ))
+
+    return _SKELETON_HTML % dict(
+        title="Mako template error",
+        exception_type=escape(type(e.rich_traceback.error).__name__),
+        exception=escape(str(e.rich_traceback.error)),
+        template_uri=escape(str(os.path.basename(e.template.filename))),
+        frames="\n".join(frames)
+    )
 
 class MakoTemplates(object):
     """
@@ -115,10 +117,8 @@ class MakoTemplates(object):
     """
 
     def __init__(self, app=None):
-        self.app = None
         if app is not None:
             self.init_app(app)
-        self.app = app
 
 
     def init_app(self, app):
@@ -137,15 +137,10 @@ class MakoTemplates(object):
             constructor with an ``app`` argument.
 
         """
-        if self.app:
-            raise RuntimeError("Cannot call init_app when app argument was "
-                               "provided to MakoTemplates constructor.")
-
         if not hasattr(app, 'extensions'):
             app.extensions = {}
 
         app.extensions['mako'] = self
-        app._mako_lookup = None
 
         app.config.setdefault('MAKO_INPUT_ENCODING', 'utf-8')
         app.config.setdefault('MAKO_OUTPUT_ENCODING', 'utf-8')
@@ -157,6 +152,12 @@ class MakoTemplates(object):
         app.config.setdefault('MAKO_DEFAULT_FILTERS', None)
         app.config.setdefault('MAKO_PREPROCESSOR', None)
         app.config.setdefault('MAKO_STRICT_UNDEFINED', False)
+        # Register custom handler for error happening in Make's template.
+        app.errorhandler(MakoTemplateError)(self.exception_handler)
+
+    def exception_handler(self, e):
+        assert isinstance(e, MakoTemplateError)
+        return render_mako_error(e), 500
 
 
 def _create_lookup(app):
@@ -215,9 +216,12 @@ def _create_lookup(app):
 
 
 def _lookup(app):
-    if not app._mako_lookup:
-        app._mako_lookup = _create_lookup(app)
-    return app._mako_lookup
+    key_name = "_mako_lookup"
+    ctxt = GLOBAL.get(key_name)
+    if ctxt is None:
+        ctxt = _create_lookup(app)
+        setattr(GLOBAL, key_name, ctxt)
+    return ctxt
 
 
 def _render(template, context, app):
@@ -231,7 +235,7 @@ def _render(template, context, app):
     except:
         translate = app.config.get("MAKO_TRANSLATE_EXCEPTIONS")
         if translate:
-            translated = TemplateError(template)
+            translated = MakoTemplateError(template)
             raise translated
         else:
             raise
@@ -245,9 +249,9 @@ def render_template(template_name, **context):
     :param context: the variables that should be available in the
                     context of the template.
     """
-    ctx = stack.top
-    return _render(_lookup(ctx.app).get_template(template_name),
-                   context, ctx.app)
+    app = current_app
+    return _render(_lookup(app).get_template(template_name),
+                   context, app)
 
 
 def render_template_string(source, **context):
@@ -259,9 +263,8 @@ def render_template_string(source, **context):
     :param context: the variables that should be available in the
                     context of the template.
     """
-    ctx = stack.top
-    template = Template(source, lookup=_lookup(ctx.app))
-    return _render(template, context, ctx.app)
+    template = Template(source, lookup=_lookup(current_app))
+    return _render(template, context, current_app)
 
 
 def render_template_def(template_name, def_name, **context):
@@ -277,6 +280,5 @@ def render_template_def(template_name, def_name, **context):
     :param context: the variables that should be available in the
                     context of the template.
     """
-    ctx = stack.top
-    template = _lookup(ctx.app).get_template(template_name)
-    return _render(template.get_def(def_name), context, ctx.app)
+    template = _lookup(current_app).get_template(template_name)
+    return _render(template.get_def(def_name), context, current_app)
