@@ -11,7 +11,7 @@
 """
 import os, sys
 
-from flask.helpers import cached_property
+from werkzeug.utils import cached_property
 from flask.signals import template_rendered
 
 # Find the context stack so we can resolve which application is calling this
